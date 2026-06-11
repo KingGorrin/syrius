@@ -12,15 +12,13 @@ import 'package:zenon_syrius_wallet_flutter/utils/extensions.dart';
 import 'package:zenon_syrius_wallet_flutter/utils/functions.dart';
 import 'package:zenon_syrius_wallet_flutter/utils/global.dart';
 import 'package:zenon_syrius_wallet_flutter/utils/notification_utils.dart';
+import 'package:zenon_syrius_wallet_flutter/utils/wallet_connect_request_utils.dart';
 import 'package:zenon_syrius_wallet_flutter/widgets/main_app_container.dart';
 import 'package:zenon_syrius_wallet_flutter/widgets/reusable_widgets/dialogs.dart';
 import 'package:zenon_syrius_wallet_flutter/widgets/reusable_widgets/icons/link_icon.dart';
 import 'package:znn_sdk_dart/znn_sdk_dart.dart';
 
-enum NoMChainId {
-  mainnet,
-  testnet,
-}
+enum NoMChainId { mainnet, testnet }
 
 extension NoMChainIdX on NoMChainId {
   String chain() {
@@ -56,9 +54,7 @@ class NoMService extends IChain {
   final Map<String, Future<dynamic>> _interactiveRequestFutures =
       <String, Future<dynamic>>{};
 
-  NoMService({
-    required this.reference,
-  }) {
+  NoMService({required this.reference}) {
     wallet = _web3WalletService.getWeb3Wallet();
   }
 
@@ -77,18 +73,47 @@ class NoMService extends IChain {
     return ['chainIdChange', 'addressChange'];
   }
 
-  Future<dynamic> handleZnnInfo(String topic, dynamic params) {
-    final key = 'znn_info:$topic';
+  Future<dynamic> handleZnnInfo(
+    String topic,
+    dynamic params, {
+    int? requestId,
+  }) {
+    // znn_info approval does not depend on params, so without a request id
+    // the key stays topic-scoped like before.
+    final key = interactiveRequestKey(
+      method: 'znn_info',
+      topic: topic,
+      params: null,
+      requestId: requestId,
+    );
     return _runSingleFlight(key, () => _methodZnnInfo(topic, params));
   }
 
-  Future<dynamic> handleZnnSign(String topic, dynamic params) {
-    final key = 'znn_sign:$topic:${params.hashCode}';
+  Future<dynamic> handleZnnSign(
+    String topic,
+    dynamic params, {
+    int? requestId,
+  }) {
+    final key = interactiveRequestKey(
+      method: 'znn_sign',
+      topic: topic,
+      params: params,
+      requestId: requestId,
+    );
     return _runSingleFlight(key, () => _methodZnnSign(topic, params));
   }
 
-  Future<dynamic> handleZnnSend(String topic, dynamic params) {
-    final key = 'znn_send:$topic:${params.hashCode}';
+  Future<dynamic> handleZnnSend(
+    String topic,
+    dynamic params, {
+    int? requestId,
+  }) {
+    final key = interactiveRequestKey(
+      method: 'znn_send',
+      topic: topic,
+      params: params,
+      requestId: requestId,
+    );
     return _runSingleFlight(key, () => _methodZnnSend(topic, params));
   }
 
@@ -133,8 +158,7 @@ class NoMService extends IChain {
       return activeAddress;
     }
 
-    final isWalletOwned = kAddressLabelMap.containsKey(requestedFromAddress) ||
-        kDefaultAddressList.contains(requestedFromAddress);
+    final isWalletOwned = _isWalletOwnedAddress(requestedFromAddress);
 
     if (isWalletOwned) {
       if (requestedFromAddress != activeAddress) {
@@ -148,10 +172,18 @@ class NoMService extends IChain {
 
     _logger.warning(
       'WalletConnect requested fromAddress not wallet-owned; '
-      'fallback to active - method=$method topic=$topic '
+      'rejecting request - method=$method topic=$topic '
       'requested=$requestedFromAddress active=$activeAddress',
     );
-    return activeAddress;
+    throw ReownCoreError(
+      code: Errors.getSdkError(Errors.UNSUPPORTED_ACCOUNTS).code,
+      message: 'fromAddress is not owned by this wallet',
+    );
+  }
+
+  bool _isWalletOwnedAddress(String address) {
+    return kAddressLabelMap.containsKey(address) ||
+        kDefaultAddressList.contains(address);
   }
 
   Future<dynamic> _runSingleFlight(
@@ -172,45 +204,54 @@ class NoMService extends IChain {
 
   Future _methodZnnInfo(String topic, dynamic params) async {
     if (!await windowManager.isFocused() || !await windowManager.isVisible()) {
-      windowManager.show();
+      await windowManager.show();
     }
     final session = _sessionByTopic(topic);
     final dAppMetadata = session.peer.metadata;
+    final dAppName = _dAppName(dAppMetadata);
+    final dAppDescription = _dAppDescription(dAppMetadata);
+    final dAppUrl = _dAppUrl(dAppMetadata);
+    final dAppIconUrl = _dAppIconUrl(dAppMetadata);
 
     final activeAddress = _resolveActiveAddress();
     _logger.info(
-        'WalletConnect request method=znn_info topic=$topic activeAddress=$activeAddress');
+      'WalletConnect request method=znn_info topic=$topic activeAddress=$activeAddress',
+    );
 
     if (kCurrentPage != Tabs.lock) {
       if (globalNavigatorKey.currentContext!.mounted) {
         final actionWasAccepted = await showDialogWithNoAndYesOptions(
           context: globalNavigatorKey.currentContext!,
           isBarrierDismissible: false,
-          title: '${dAppMetadata.name} - Information',
+          title: '$dAppName - Information',
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Text('Are you sure you want to allow ${dAppMetadata.name} to '
-                  'retrieve the current address, node URL and chain identifier information?'),
-              kVerticalSpacing,
-              Image(
-                image: NetworkImage(dAppMetadata.icons.first),
-                height: 100.0,
-                fit: BoxFit.fitHeight,
+              Text(
+                'Are you sure you want to allow $dAppName to '
+                'retrieve the current address, node URL and chain identifier information?',
               ),
               kVerticalSpacing,
-              Text(dAppMetadata.description),
+              if (dAppIconUrl != null)
+                Image(
+                  image: NetworkImage(dAppIconUrl),
+                  height: 100.0,
+                  fit: BoxFit.fitHeight,
+                ),
               kVerticalSpacing,
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(dAppMetadata.url),
-                  LinkIcon(
-                    url: dAppMetadata.url,
-                  )
-                ],
-              ),
+              Text(dAppDescription),
+              kVerticalSpacing,
+              if (dAppUrl != null)
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: Text(dAppUrl, overflow: TextOverflow.ellipsis),
+                    ),
+                    LinkIcon(url: dAppUrl),
+                  ],
+                ),
             ],
           ),
           onYesButtonPressed: () async {},
@@ -225,8 +266,9 @@ class NoMService extends IChain {
           };
         } else {
           await NotificationUtils.sendNotificationError(
-              Errors.getSdkError(Errors.USER_REJECTED),
-              'You have rejected the WalletConnect request');
+            Errors.getSdkError(Errors.USER_REJECTED),
+            'You have rejected the WalletConnect request',
+          );
           throw Errors.getSdkError(Errors.USER_REJECTED);
         }
       } else {
@@ -239,10 +281,14 @@ class NoMService extends IChain {
 
   Future _methodZnnSign(String topic, dynamic params) async {
     if (!await windowManager.isFocused() || !await windowManager.isVisible()) {
-      windowManager.show();
+      await windowManager.show();
     }
     final session = _sessionByTopic(topic);
     final dAppMetadata = session.peer.metadata;
+    final dAppName = _dAppName(dAppMetadata);
+    final dAppDescription = _dAppDescription(dAppMetadata);
+    final dAppUrl = _dAppUrl(dAppMetadata);
+    final dAppIconUrl = _dAppIconUrl(dAppMetadata);
     final activeAddress = _resolveActiveAddress();
     final requestedFromAddress = _extractRequestedFromAddress(params);
     final signerAddress = _resolveSignerAddress(
@@ -265,31 +311,37 @@ class NoMService extends IChain {
         final actionWasAccepted = await showDialogWithNoAndYesOptions(
           context: globalNavigatorKey.currentContext!,
           isBarrierDismissible: false,
-          title: '${dAppMetadata.name} - Sign Message',
+          title: '$dAppName - Sign Message',
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Text('Are you sure you want to '
-                  'sign message $message ?'),
-              kVerticalSpacing,
-              Image(
-                image: NetworkImage(dAppMetadata.icons.first),
-                height: 100.0,
-                fit: BoxFit.fitHeight,
+              Text(
+                'Are you sure you want to '
+                'sign message $message ?',
               ),
               kVerticalSpacing,
-              Text(dAppMetadata.description),
+              Text('Signing address: $signerAddress'),
               kVerticalSpacing,
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(dAppMetadata.url),
-                  LinkIcon(
-                    url: dAppMetadata.url,
-                  )
-                ],
-              ),
+              if (dAppIconUrl != null)
+                Image(
+                  image: NetworkImage(dAppIconUrl),
+                  height: 100.0,
+                  fit: BoxFit.fitHeight,
+                ),
+              kVerticalSpacing,
+              Text(dAppDescription),
+              kVerticalSpacing,
+              if (dAppUrl != null)
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: Text(dAppUrl, overflow: TextOverflow.ellipsis),
+                    ),
+                    LinkIcon(url: dAppUrl),
+                  ],
+                ),
             ],
           ),
           onYesButtonPressed: () async {},
@@ -300,8 +352,9 @@ class NoMService extends IChain {
           return await walletSign(message.codeUnits, address: signerAddress);
         } else {
           await NotificationUtils.sendNotificationError(
-              Errors.getSdkError(Errors.USER_REJECTED),
-              'You have rejected the WalletConnect request');
+            Errors.getSdkError(Errors.USER_REJECTED),
+            'You have rejected the WalletConnect request',
+          );
           throw Errors.getSdkError(Errors.USER_REJECTED);
         }
       } else {
@@ -314,10 +367,14 @@ class NoMService extends IChain {
 
   Future _methodZnnSend(String topic, dynamic params) async {
     if (!await windowManager.isFocused() || !await windowManager.isVisible()) {
-      windowManager.show();
+      await windowManager.show();
     }
     final session = _sessionByTopic(topic);
     final dAppMetadata = session.peer.metadata;
+    final dAppName = _dAppName(dAppMetadata);
+    final dAppDescription = _dAppDescription(dAppMetadata);
+    final dAppUrl = _dAppUrl(dAppMetadata);
+    final dAppIconUrl = _dAppIconUrl(dAppMetadata);
     final activeAddress = _resolveActiveAddress();
     final requestedFromAddress = _extractRequestedFromAddress(params);
     final signerAddress = _resolveSignerAddress(
@@ -328,8 +385,9 @@ class NoMService extends IChain {
     );
 
     if (kCurrentPage != Tabs.lock) {
-      final accountBlock =
-          AccountBlockTemplate.fromJson(params['accountBlock']);
+      final accountBlock = AccountBlockTemplate.fromJson(
+        params['accountBlock'],
+      );
 
       _logger.info(
         'WalletConnect request method=znn_send topic=$topic '
@@ -341,8 +399,9 @@ class NoMService extends IChain {
         accountBlock.toAddress.toString(),
       );
 
-      final token =
-          await zenon!.embedded.token.getByZts(accountBlock.tokenStandard);
+      final token = await zenon!.embedded.token.getByZts(
+        accountBlock.tokenStandard,
+      );
 
       final amount = accountBlock.amount.addDecimals(token!.decimals);
 
@@ -352,37 +411,43 @@ class NoMService extends IChain {
         final wasActionAccepted = await showDialogWithNoAndYesOptions(
           context: globalNavigatorKey.currentContext!,
           isBarrierDismissible: false,
-          title: '${dAppMetadata.name} - Send Payment',
+          title: '$dAppName - Send Payment',
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Text('Are you sure you want to transfer '
-                  '$amount ${token.symbol} to '
-                  '$toAddress ?'),
-              kVerticalSpacing,
-              Image(
-                image: NetworkImage(dAppMetadata.icons.first),
-                height: 100.0,
-                fit: BoxFit.fitHeight,
+              Text(
+                'Are you sure you want to transfer '
+                '$amount ${token.symbol} to '
+                '$toAddress ?',
               ),
               kVerticalSpacing,
-              Text(dAppMetadata.description),
+              Text('Source address: $signerAddress'),
               kVerticalSpacing,
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(dAppMetadata.url),
-                  LinkIcon(
-                    url: dAppMetadata.url,
-                  )
-                ],
-              ),
+              if (dAppIconUrl != null)
+                Image(
+                  image: NetworkImage(dAppIconUrl),
+                  height: 100.0,
+                  fit: BoxFit.fitHeight,
+                ),
+              kVerticalSpacing,
+              Text(dAppDescription),
+              kVerticalSpacing,
+              if (dAppUrl != null)
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: Text(dAppUrl, overflow: TextOverflow.ellipsis),
+                    ),
+                    LinkIcon(url: dAppUrl),
+                  ],
+                ),
             ],
           ),
           description: 'Are you sure you want to transfer '
               '$amount ${token.symbol} to '
-              '$toAddress ?',
+              '$toAddress from $signerAddress ?',
           onYesButtonPressed: () {},
           onNoButtonPressed: () {},
         );
@@ -400,8 +465,9 @@ class NoMService extends IChain {
           return result!;
         } else {
           await NotificationUtils.sendNotificationError(
-              Errors.getSdkError(Errors.USER_REJECTED),
-              'You have rejected the WalletConnect request');
+            Errors.getSdkError(Errors.USER_REJECTED),
+            'You have rejected the WalletConnect request',
+          );
           throw Errors.getSdkError(Errors.USER_REJECTED);
         }
       } else {
@@ -410,5 +476,41 @@ class NoMService extends IChain {
     } else {
       throw _walletLockedError;
     }
+  }
+
+  String _dAppName(PairingMetadata metadata) {
+    return _metadataValue(metadata.name, 'Unknown dApp');
+  }
+
+  String _dAppDescription(PairingMetadata metadata) {
+    return _metadataValue(metadata.description, 'No description provided');
+  }
+
+  String? _dAppUrl(PairingMetadata metadata) {
+    final value = _metadataValue(metadata.url, '');
+    final uri = Uri.tryParse(value);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return null;
+    }
+    return value;
+  }
+
+  String? _dAppIconUrl(PairingMetadata metadata) {
+    for (final icon in metadata.icons) {
+      final value = _metadataValue(icon, '');
+      final uri = Uri.tryParse(value);
+      if (uri != null && (uri.scheme == 'http' || uri.scheme == 'https')) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  String _metadataValue(String value, String fallback) {
+    final trimmed = value.trim();
+    if (trimmed.isEmpty || trimmed.toLowerCase() == 'null') {
+      return fallback;
+    }
+    return trimmed;
   }
 }

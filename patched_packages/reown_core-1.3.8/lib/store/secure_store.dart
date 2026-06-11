@@ -7,6 +7,11 @@ import 'package:reown_core/utils/constants.dart';
 import 'package:reown_core/utils/errors.dart';
 
 class SecureStore implements IStore<Map<String, dynamic>> {
+  /// Marker persisted in the fallback storage once secure storage has failed,
+  /// so the fallback keeps being used on subsequent launches even when secure
+  /// reads succeed again (e.g. macOS keychain reads work but writes fail).
+  static const String _fallbackFlagKey = 'secure_store_fallback_mode';
+
   late final FlutterSecureStorage _secureStorage;
   late final IStore<Map<String, dynamic>> _fallbackStorage;
   bool _initialized = false;
@@ -29,8 +34,12 @@ class SecureStore implements IStore<Map<String, dynamic>> {
   SecureStore({
     Map<String, Map<String, dynamic>>? defaultValue,
     required IStore<Map<String, dynamic>> fallbackStorage,
+    FlutterSecureStorage? secureStorage,
   }) : _map = defaultValue ?? {},
-       _fallbackStorage = fallbackStorage;
+       _fallbackStorage = fallbackStorage,
+       _injectedSecureStorage = secureStorage;
+
+  final FlutterSecureStorage? _injectedSecureStorage;
 
   @override
   Future<void> init() async {
@@ -40,17 +49,27 @@ class SecureStore implements IStore<Map<String, dynamic>> {
 
     try {
       // Try secure storage first
-      _secureStorage = const FlutterSecureStorage(
-        aOptions: AndroidOptions(encryptedSharedPreferences: true),
-        iOptions: IOSOptions(
-          accessibility: KeychainAccessibility.first_unlock_this_device,
-        ),
-      );
+      _secureStorage = _injectedSecureStorage ??
+          const FlutterSecureStorage(
+            aOptions: AndroidOptions(encryptedSharedPreferences: true),
+            iOptions: IOSOptions(
+              accessibility: KeychainAccessibility.first_unlock_this_device,
+            ),
+          );
 
-      await restore();
+      if (_fallbackStorage.has(_fallbackFlagKey)) {
+        // A previous launch already switched to the fallback storage; keep
+        // using it instead of treating possibly stale secure data as
+        // authoritative.
+        _useFallbackStorage = true;
+        await _restoreFromFallback();
+      } else {
+        await restore();
+      }
     } catch (e) {
       // Fall back to regular storage if secure storage fails
       _useFallbackStorage = true;
+      await _persistFallbackFlag();
       // Try to restore from fallback storage
       await _restoreFromFallback();
     }
@@ -61,6 +80,10 @@ class SecureStore implements IStore<Map<String, dynamic>> {
   @override
   Map<String, dynamic>? get(String key) {
     _checkInitialized();
+
+    if (_useFallbackStorage) {
+      return _fallbackStorage.get(key);
+    }
 
     final String keyWithPrefix = _addPrefix(key);
     if (_map.containsKey(keyWithPrefix)) {
@@ -75,6 +98,11 @@ class SecureStore implements IStore<Map<String, dynamic>> {
   @override
   bool has(String key) {
     _checkInitialized();
+
+    if (_useFallbackStorage) {
+      return _fallbackStorage.has(key);
+    }
+
     final String keyWithPrefix = _addPrefix(key);
 
     // Only check memory for secure storage (can't check secure storage synchronously)
@@ -84,6 +112,11 @@ class SecureStore implements IStore<Map<String, dynamic>> {
   @override
   List<Map<String, dynamic>> getAll() {
     _checkInitialized();
+
+    if (_useFallbackStorage) {
+      return _fallbackStorage.getAll().cast<Map<String, dynamic>>();
+    }
+
     return values;
   }
 
@@ -101,10 +134,7 @@ class SecureStore implements IStore<Map<String, dynamic>> {
         final stringValue = jsonEncode(value);
         await _secureStorage.write(key: keyWithPrefix, value: stringValue);
       } catch (e) {
-        throw Errors.getInternalError(
-          Errors.MISSING_OR_INVALID,
-          context: e.toString(),
-        );
+        await _switchToFallbackStorage(e);
       }
     }
   }
@@ -125,10 +155,7 @@ class SecureStore implements IStore<Map<String, dynamic>> {
           final stringValue = jsonEncode(value);
           await _secureStorage.write(key: keyWithPrefix, value: stringValue);
         } catch (e) {
-          throw Errors.getInternalError(
-            Errors.MISSING_OR_INVALID,
-            context: e.toString(),
-          );
+          await _switchToFallbackStorage(e);
         }
       }
     }
@@ -144,7 +171,12 @@ class SecureStore implements IStore<Map<String, dynamic>> {
     if (_useFallbackStorage) {
       await _fallbackStorage.delete(key);
     } else {
-      await _secureStorage.delete(key: keyWithPrefix);
+      try {
+        await _secureStorage.delete(key: keyWithPrefix);
+      } catch (e) {
+        await _switchToFallbackStorage(e);
+        await _fallbackStorage.delete(key);
+      }
     }
   }
 
@@ -155,12 +187,17 @@ class SecureStore implements IStore<Map<String, dynamic>> {
     if (_useFallbackStorage) {
       await _fallbackStorage.deleteAll();
     } else {
-      // Get all keys from secure storage and delete them
-      final allKeys = await _secureStorage.readAll();
-      for (final key in allKeys.keys) {
-        if (key.startsWith(storagePrefix)) {
-          await _secureStorage.delete(key: key);
+      try {
+        // Get all keys from secure storage and delete them
+        final allKeys = await _secureStorage.readAll();
+        for (final key in allKeys.keys) {
+          if (key.startsWith(storagePrefix)) {
+            await _secureStorage.delete(key: key);
+          }
         }
+      } catch (e) {
+        await _switchToFallbackStorage(e);
+        await _fallbackStorage.deleteAll();
       }
     }
 
@@ -198,15 +235,16 @@ class SecureStore implements IStore<Map<String, dynamic>> {
 
   Future<void> _restoreFromFallback() async {
     try {
-      // Get all keys from fallback storage
-      final allKeys = _fallbackStorage.getAll();
+      for (final key in _fallbackStorage.keys) {
+        if (!key.startsWith(storagePrefix)) {
+          continue;
+        }
+        if (key == _addPrefix(_fallbackFlagKey)) {
+          continue;
+        }
 
-      // Restore data to memory map
-      for (final entry in allKeys) {
-        final key = entry.keys.first;
-        final value = entry.values.first;
-
-        if (key.startsWith(storagePrefix)) {
+        final value = _fallbackStorage.get(_removePrefix(key));
+        if (value != null) {
           _map[key] = value;
         }
       }
@@ -215,8 +253,44 @@ class SecureStore implements IStore<Map<String, dynamic>> {
     }
   }
 
+  Future<void> _switchToFallbackStorage(Object error) async {
+    if (_useFallbackStorage) {
+      return;
+    }
+
+    debugPrint(
+      'Warning: Secure storage failed, using fallback storage: $error',
+    );
+    _useFallbackStorage = true;
+    await _persistFallbackFlag();
+
+    for (final entry in _map.entries) {
+      await _setFallbackValue(_removePrefix(entry.key), entry.value);
+    }
+  }
+
+  Future<void> _setFallbackValue(String key, Map<String, dynamic> value) async {
+    await _fallbackStorage.set(key, value);
+  }
+
+  Future<void> _persistFallbackFlag() async {
+    try {
+      await _fallbackStorage.set(_fallbackFlagKey, {'enabled': true});
+    } catch (e) {
+      debugPrint(
+        'Warning: Failed to persist secure storage fallback flag: $e',
+      );
+    }
+  }
+
   String _addPrefix(String key) {
     return '$storagePrefix$key';
+  }
+
+  String _removePrefix(String key) {
+    return key.startsWith(storagePrefix)
+        ? key.substring(storagePrefix.length)
+        : key;
   }
 
   void _checkInitialized() {
